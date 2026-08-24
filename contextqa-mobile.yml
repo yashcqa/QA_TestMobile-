@@ -1,1 +1,142 @@
 
+name: ContextQA Mobile Test Plan
+
+# ---------------------------------------------------------------------------
+# Required repository secrets
+#   CQA_CI_TOKEN  - the v2:... CI token minted from /api/public/token/ci
+#   CQA_SERVER    - https://server.dev.contextqa.com
+#   CQA_ORIGIN    - https://errorsquad.qa.contextqa.com/api
+#   CQA_TENANT_UI - https://errorsquad.qa.contextqa.com      (no /api)
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_id:
+        description: "Test plan id (820 = Pixel 9 x2, 819 = Galaxy S25)"
+        required: true
+        default: "820"
+      apk_url:
+        description: "Public URL of the APK release asset"
+        required: true
+      timeout_minutes:
+        description: "How long to wait for the run to finish"
+        required: false
+        default: "30"
+
+jobs:
+  run-plan:
+    runs-on: ubuntu-latest
+
+    env:
+      SERVER:    ${{ secrets.CQA_SERVER }}
+      ORIGIN:    ${{ secrets.CQA_ORIGIN }}
+      TENANT_UI: ${{ secrets.CQA_TENANT_UI }}
+      CI_TOKEN:  ${{ secrets.CQA_CI_TOKEN }}
+
+    steps:
+      # A missing or misspelled secret resolves to an empty string rather than
+      # failing, which produces very confusing curl errors further down.
+      - name: Check secrets are present
+        run: |
+          missing=""
+          [ -z "$SERVER" ]    && missing="$missing CQA_SERVER"
+          [ -z "$ORIGIN" ]    && missing="$missing CQA_ORIGIN"
+          [ -z "$TENANT_UI" ] && missing="$missing CQA_TENANT_UI"
+          [ -z "$CI_TOKEN" ]  && missing="$missing CQA_CI_TOKEN"
+
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            echo "Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          case "$CI_TOKEN" in
+            v2:*) echo "CI token looks well formed." ;;
+            *)    echo "::warning::CQA_CI_TOKEN does not start with 'v2:' - it may be stale or truncated." ;;
+          esac
+
+      - name: Verify the APK URL is publicly reachable
+        run: |
+          echo "Checking ${{ inputs.apk_url }}"
+          code=$(curl -sSL -o /dev/null -w '%{http_code}' "${{ inputs.apk_url }}")
+          echo "HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::APK URL returned $code. ContextQA fetches this anonymously, so a private repo or wrong filename will fail here."
+            exit 1
+          fi
+
+      - name: Trigger plan ${{ inputs.plan_id }}
+        id: trigger
+        run: |
+          # Execute endpoints are root level - no /api prefix on this one.
+          raw=$(curl -s -H "token: $CI_TOKEN" \
+                        -H "Cqa-Origin: $ORIGIN" -G \
+            "$SERVER/test_plans/${{ inputs.plan_id }}/execution" \
+            --data-urlencode "apk_build_url=${{ inputs.apk_url }}")
+
+          echo "Response: $raw"
+
+          run_id=$(echo "$raw" | jq -r '.id // empty' 2>/dev/null)
+          if [ -z "$run_id" ]; then
+            echo "::error::No run id returned. Token may have expired, or plan ${{ inputs.plan_id }} is not an Android plan / has no cases attached."
+            exit 1
+          fi
+
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "report=$TENANT_UI/td/1/plans/${{ inputs.plan_id }}/reports?runResultId=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Run id: $run_id"
+
+      - name: Poll until complete
+        id: poll
+        run: |
+          RUN_ID="${{ steps.trigger.outputs.run_id }}"
+          deadline=$(( $(date +%s) + ${{ inputs.timeout_minutes }} * 60 ))
+          status="UNKNOWN"
+
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            res=$(curl -s -H "token: $CI_TOKEN" \
+                          -H "Cqa-Origin: $ORIGIN" \
+              "$SERVER/test_plan_results/$RUN_ID/results")
+
+            status=$(echo "$res" | jq -r '.status // "UNKNOWN"' 2>/dev/null)
+            echo "$(date -u +%H:%M:%S) status: $status"
+
+            if [ "$status" = "STATUS_COMPLETED" ]; then
+              echo "$res" | jq . > result.json
+              echo "result=$(echo "$res" | jq -r '.result // "UNKNOWN"')" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 30
+          done
+
+          echo "::error::Timed out after ${{ inputs.timeout_minutes }}m - last status: $status"
+          echo "Plans 817, 818, 821 and 823 have stalled the same way in this environment."
+          exit 2
+
+      - name: Upload result JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contextqa-result-${{ steps.trigger.outputs.run_id }}
+          path: result.json
+          if-no-files-found: ignore
+
+      - name: Gate the build
+        run: |
+          {
+            echo "### ContextQA run ${{ steps.trigger.outputs.run_id }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Plan | ${{ inputs.plan_id }} |"
+            echo "| Result | **${{ steps.poll.outputs.result }}** |"
+            echo ""
+            echo "[View full report](${{ steps.trigger.outputs.report }})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.poll.outputs.result }}" != "SUCCESS" ]; then
+            echo "::error::Plan result was ${{ steps.poll.outputs.result }}"
+            exit 1
+          fi
+          echo "Plan passed."
